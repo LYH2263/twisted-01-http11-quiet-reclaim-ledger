@@ -43,6 +43,17 @@ from twisted.python.compat import networkString
 from twisted.python.components import proxyForInterface
 from twisted.python.failure import Failure
 from twisted.web._abnf import _decint, _istoken
+from twisted.web._reclaim import (
+    PARSER_DISCONNECT,
+    PROTOCOL_ABORT,
+    REQUEST_CANCEL_ABORT,
+    REQUEST_CANCEL_DEFERRED,
+    REQUEST_NOT_SENT,
+    RESPONSE_ABANDON,
+    RESPONSE_RECLAIM,
+    RESPONSE_RECLAIM_FAILED,
+    _NULL_RECLAIM_LEDGER,
+)
 from twisted.web.http import (
     NO_CONTENT,
     NOT_MODIFIED,
@@ -370,6 +381,11 @@ class HTTPClientParser(HTTPParser):
         self.finisher = finisher
         self._responseDeferred = Deferred()
         self._everReceivedData = False
+        # Optional L{twisted.web._reclaim._ReclaimToken} binding the response
+        # (and therefore a readBody cancel) to the request generation of the
+        # connection that is about to receive it.  L{None} unless a quiet
+        # reclaim ledger is active.
+        self._reclaimToken = None
 
     def dataReceived(self, data):
         """
@@ -429,6 +445,7 @@ class HTTPClientParser(HTTPParser):
             self.headers,
             self.transport,
             self.request,
+            _reclaimToken=self._reclaimToken,
         )
 
     def _finished(self, rest):
@@ -1143,9 +1160,14 @@ class Response:
         self._state = "INITIAL"
         self.request = None
         self.previousResponse = None
+        # Optional L{twisted.web._reclaim._ReclaimToken} used to settle a
+        # readBody cancel against the request generation that owns the
+        # connection.  L{None} unless a quiet reclaim ledger is active.
+        self._reclaimToken = None
 
     @classmethod
-    def _construct(cls, version, code, phrase, headers, _transport, request):
+    def _construct(cls, version, code, phrase, headers, _transport, request,
+                   _reclaimToken=None):
         """
         Private constructor.
 
@@ -1155,11 +1177,14 @@ class Response:
         @param headers: See L{__init__}.
         @param _transport: See L{__init__}.
         @param request: See L{IResponse.request}.
+        @param _reclaimToken: Optional reclaim token binding this response to
+            the request generation on its connection.
 
         @return: L{Response} instance.
         """
         response = Response(version, code, phrase, headers, _transport)
         response.request = _ClientRequestProxy(request)
+        response._reclaimToken = _reclaimToken
         return response
 
     def setPreviousResponse(self, previousResponse):
@@ -1494,9 +1519,20 @@ class HTTP11ClientProtocol(Protocol):
     _responseDeferred: Deferred[IResponse] | None = None
     _log = Logger()
 
-    def __init__(self, quiescentCallback=lambda c: None):
+    def __init__(self, quiescentCallback=lambda c: None, reclaimLedger=None):
         self._quiescentCallback = quiescentCallback
         self._abortDeferreds = []
+        # The quiet-reclaim ledger this protocol settles into, if any.  The
+        # null ledger makes all settlement calls no-ops so behaviour is
+        # unchanged when the host did not declare one.
+        self._reclaimLedger = (
+            reclaimLedger if reclaimLedger is not None else _NULL_RECLAIM_LEDGER
+        )
+        # Each accepted request() is a new generation on the same connection.
+        # The ledger stamps every settlement with its generation, so an inner
+        # request cannot be confused with an outer one still holding the
+        # connection.
+        self._requestGeneration = 0
 
     def connectionMade(self) -> None:
         if ITCPTransport.providedBy(self.transport):
@@ -1526,20 +1562,47 @@ class HTTP11ClientProtocol(Protocol):
             any more requests using this L{HTTP11ClientProtocol}.
         """
         if self._state != "QUIESCENT":
+            # A nested/interleaved request does not write through the lease
+            # and generation held by the request still in flight: it is
+            # refused on this distinct completion face.
+            self._reclaimLedger.settle(
+                REQUEST_NOT_SENT,
+                connection=self,
+                generation=self._requestGeneration,
+                state=self._state,
+            )
             return fail(RequestNotSent())
 
         self._state = "TRANSMITTING"
+        self._requestGeneration += 1
+        generation = self._requestGeneration
         try:
             _requestDeferred = request.writeTo(self.transport)
         except BaseException:
             _requestDeferred = fail()
 
         def cancelRequest(ign):
-            # Explicitly cancel the request's deferred if it's still trying to
-            # write when this request is cancelled.
+            # These are two distinct completion faces: while the request is
+            # still being written (or the response arrived before the request
+            # finished writing) cancelling only cancels the request
+            # generation's Deferred; in every other state the cancel itself
+            # aborts the transport and disconnects the parser with
+            # CancelledError.
             if self._state in ("TRANSMITTING", "TRANSMITTING_AFTER_RECEIVING_RESPONSE"):
+                self._reclaimLedger.settle(
+                    REQUEST_CANCEL_DEFERRED,
+                    connection=self,
+                    generation=generation,
+                    state=self._state,
+                )
                 _requestDeferred.cancel()
             else:
+                self._reclaimLedger.settle(
+                    REQUEST_CANCEL_ABORT,
+                    connection=self,
+                    generation=generation,
+                    state=self._state,
+                )
                 self.transport.abortConnection()
                 self._disconnectParser(Failure(CancelledError()))
 
@@ -1552,6 +1615,9 @@ class HTTP11ClientProtocol(Protocol):
         self._transportProxy = TransportProxyProducer(self.transport)
         self._parser = HTTPClientParser(request, self._finishResponse)
         self._parser.makeConnection(self._transportProxy)
+        # Bind this generation's response (and therefore any readBody
+        # cancel) to the ledger, if one is active.
+        self._parser._reclaimToken = self._reclaimLedger.tokenFor(self, generation)
         self._responseDeferred = self._parser._responseDeferred
 
         def cbRequestWritten(ignored):
@@ -1617,11 +1683,23 @@ class HTTP11ClientProtocol(Protocol):
 
         reason = ConnectionDone("synthetic!")
         connHeaders = self._parser.connHeaders.getRawHeaders(b"Connection", ())
-        if (
-            (b"close" in connHeaders)
-            or self._state != "QUIESCENT"
-            or not self._currentRequest.persistent
-        ):
+        if b"close" in connHeaders:
+            abandonReason = "connection-close-header"
+        elif self._state != "QUIESCENT":
+            abandonReason = "response-before-request-finished"
+        elif not self._currentRequest.persistent:
+            abandonReason = "non-persistent-request"
+        else:
+            abandonReason = None
+        if abandonReason is not None:
+            # The connection will not be returned to the pool: settle the
+            # abandon face before giving it up.
+            self._reclaimLedger.settle(
+                RESPONSE_ABANDON,
+                connection=self,
+                generation=self._requestGeneration,
+                reason=abandonReason,
+            )
             self._giveUp(Failure._withoutTraceback(reason))
         else:
             # Just in case we had paused the transport, resume it before
@@ -1635,8 +1713,24 @@ class HTTP11ClientProtocol(Protocol):
                 self._quiescentCallback(self)
             if op.failed:
                 # If callback throws exception, just log it and disconnect;
-                # keeping persistent connections around is an optimisation:
+                # keeping persistent connections around is an optimisation.
+                # This is its own face: the quiet reclaim failed and the
+                # connection must not enter the pool.
+                self._reclaimLedger.settle(
+                    RESPONSE_RECLAIM_FAILED,
+                    connection=self,
+                    generation=self._requestGeneration,
+                )
                 self.transport.loseConnection()
+            else:
+                # The quiescent callback (pool re-entry) committed while the
+                # parser was still attached: reclaim is settled *before* the
+                # parser disconnects.
+                self._reclaimLedger.settle(
+                    RESPONSE_RECLAIM,
+                    connection=self,
+                    generation=self._requestGeneration,
+                )
             self._disconnectParser(reason)
 
     _finishResponse_TRANSMITTING = _finishResponse_WAITING
@@ -1654,6 +1748,17 @@ class HTTP11ClientProtocol(Protocol):
             self._currentRequest = None
             self._finishedRequest = None
             self._responseDeferred = None
+
+            # Record the parser-disconnect face and the structural reason so
+            # a CancelledError disconnect (request abort) is causally
+            # distinguishable from the normal ConnectionDone one (response
+            # complete / abandoned).
+            reasonValue = getattr(reason, "value", reason)
+            self._reclaimLedger.settle(
+                PARSER_DISCONNECT,
+                connection=self,
+                reason=type(reasonValue).__name__,
+            )
 
             # The parser is no longer allowed to do anything to the real
             # transport.  Stop proxying from the parser's transport to the real
@@ -1752,6 +1857,15 @@ class HTTP11ClientProtocol(Protocol):
         """
         if self._state == "CONNECTION_LOST":
             return succeed(None)
+        # The batch-close face (HTTPConnectionPool.closeCachedConnections):
+        # a graceful loseConnection whose completion joins only when the
+        # connection is actually lost, distinct from request-cancel aborts and
+        # from idle-timeout / eviction loses.
+        self._reclaimLedger.settle(
+            PROTOCOL_ABORT,
+            connection=self,
+            generation=self._requestGeneration,
+        )
         self.transport.loseConnection()
         self._state = "ABORTING"
         d = Deferred()

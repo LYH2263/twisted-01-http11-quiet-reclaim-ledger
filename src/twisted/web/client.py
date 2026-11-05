@@ -46,6 +46,18 @@ from twisted.python.deprecate import (
 from twisted.python.failure import Failure
 from twisted.web import error, http
 from twisted.web._newclient import _ensureValidMethod, _ensureValidURI
+from twisted.web._reclaim import (
+    POOL_CLOSE_ABORT,
+    POOL_CLOSE_JOIN,
+    POOL_CONNECT,
+    POOL_EVICT,
+    POOL_IDLE,
+    POOL_LEASE,
+    POOL_PUT,
+    POOL_REJECT,
+    QuietReclaimLedger,
+    _NULL_RECLAIM_LEDGER,
+)
 from twisted.web.http_headers import Headers, _nameEncoder
 from twisted.web.iweb import (
     UNKNOWN_LENGTH,
@@ -637,9 +649,12 @@ class _HTTP11ClientFactory(protocol.Factory):
     @since: 11.1
     """
 
-    def __init__(self, quiescentCallback, metadata):
+    def __init__(self, quiescentCallback, metadata, reclaimLedger=None):
         self._quiescentCallback = quiescentCallback
         self._metadata = metadata
+        # Optional L{twisted.web._reclaim.QuietReclaimLedger}; when L{None}
+        # the built protocols settle into the null (no-op) ledger.
+        self._reclaimLedger = reclaimLedger
 
     def __repr__(self) -> str:
         return "_HTTP11ClientFactory({}, {})".format(
@@ -647,7 +662,10 @@ class _HTTP11ClientFactory(protocol.Factory):
         )
 
     def buildProtocol(self, addr: IAddress | None) -> HTTP11ClientProtocol:
-        return HTTP11ClientProtocol(self._quiescentCallback)
+        return HTTP11ClientProtocol(
+            self._quiescentCallback,
+            reclaimLedger=self._reclaimLedger,
+        )
 
 
 class _RetryingHTTP11ClientProtocol:
@@ -764,6 +782,14 @@ class HTTPConnectionPool:
         self.persistent = persistent
         self._connections = {}
         self._timeouts = {}
+        # Join the quiet-reclaim settlement ledger declared for this reactor,
+        # if any.  Without a declaration the null ledger keeps every
+        # instrumented exit identical to the un-pooled pin behaviour; no new
+        # constructor argument is required.
+        ledger = QuietReclaimLedger.declaredFor(reactor)
+        self._reclaimLedger = (
+            ledger if ledger is not None else _NULL_RECLAIM_LEDGER
+        )
 
     def getConnection(
         self, key: Hashable, endpoint: IStreamClientEndpoint
@@ -796,6 +822,15 @@ class HTTPConnectionPool:
             self._timeouts[connection].cancel()
             del self._timeouts[connection]
             if connection.state == "QUIESCENT":
+                # The cached lease is taken and its idle timeout committed:
+                # settle the checkout before handing the connection out.
+                self._reclaimLedger.settle(
+                    POOL_LEASE,
+                    key=key,
+                    connection=connection,
+                    generation=getattr(connection, "_requestGeneration", None),
+                    timeoutCancelled=True,
+                )
                 if self.retryAutomatically:
                     newConnection = lambda: self._newConnection(key, endpoint)
                     connection = _RetryingHTTP11ClientProtocol(
@@ -817,7 +852,12 @@ class HTTPConnectionPool:
         def quiescentCallback(protocol):
             self._putConnection(key, protocol)
 
+        self._reclaimLedger.settle(POOL_CONNECT, key=key, endpoint=repr(endpoint))
         factory = self._factory(quiescentCallback, repr(endpoint))
+        # Pass the ledger to real factories; test doubles that do not know
+        # about it simply ignore the extra attribute.
+        if self._reclaimLedger is not _NULL_RECLAIM_LEDGER:
+            factory._reclaimLedger = self._reclaimLedger
         result: Deferred[HTTP11ClientProtocol] = endpoint.connect(
             factory
         )  # type:ignore[assignment]
@@ -827,6 +867,14 @@ class HTTPConnectionPool:
         """
         Remove a connection from the cache and disconnect it.
         """
+        # The idle-timeout face: loseConnection driven by the cached idle
+        # timeout, distinct from over-limit eviction and batch abort.
+        self._reclaimLedger.settle(
+            POOL_IDLE,
+            key=key,
+            connection=connection,
+            generation=getattr(connection, "_requestGeneration", None),
+        )
         connection.transport.loseConnection()
         self._connections[key].remove(connection)
         del self._timeouts[connection]
@@ -838,6 +886,12 @@ class HTTPConnectionPool:
         """
         if connection.state != "QUIESCENT":
             # Log with traceback for debugging purposes:
+            self._reclaimLedger.settle(
+                POOL_REJECT,
+                key=key,
+                connection=connection,
+                state=getattr(connection, "state", None),
+            )
             try:
                 raise RuntimeError(
                     "BUG: Non-quiescent protocol added to connection pool."
@@ -850,6 +904,15 @@ class HTTPConnectionPool:
         connections = self._connections.setdefault(key, [])
         if len(connections) == self.maxPersistentPerHost:
             dropped = connections.pop(0)
+            # The over-limit eviction face: the head of the queue is lost and
+            # its idle timeout cancelled before the new member is put.
+            self._reclaimLedger.settle(
+                POOL_EVICT,
+                key=key,
+                connection=dropped,
+                generation=getattr(dropped, "_requestGeneration", None),
+                reason="maxPersistentPerHost",
+            )
             dropped.transport.loseConnection()
             self._timeouts[dropped].cancel()
             del self._timeouts[dropped]
@@ -858,6 +921,15 @@ class HTTPConnectionPool:
             self.cachedConnectionTimeout, self._removeConnection, key, connection
         )
         self._timeouts[connection] = cid
+        # The quiet pool-put face: membership committed and an idle timeout
+        # now guards the cached connection.
+        self._reclaimLedger.settle(
+            POOL_PUT,
+            key=key,
+            connection=connection,
+            generation=getattr(connection, "_requestGeneration", None),
+            idleTimeout=self.cachedConnectionTimeout,
+        )
 
     def closeCachedConnections(self):
         """
@@ -867,14 +939,31 @@ class HTTPConnectionPool:
             closed.
         """
         results = []
-        for protocols in self._connections.values():
+        for key, protocols in self._connections.items():
             for p in protocols:
+                # One abort face per cached connection before it is asked to
+                # close.
+                self._reclaimLedger.settle(
+                    POOL_CLOSE_ABORT,
+                    key=key,
+                    connection=p,
+                    generation=getattr(p, "_requestGeneration", None),
+                )
                 results.append(p.abort())
+        closed = len(results)
         self._connections = {}
         for dc in self._timeouts.values():
             dc.cancel()
         self._timeouts = {}
-        return defer.gatherResults(results).addCallback(lambda ign: None)
+
+        def _joined(ignored):
+            # The batch join face only settles once every abort has completed.
+            self._reclaimLedger.settle(POOL_CLOSE_JOIN, closed=closed)
+            return None
+
+        return defer.gatherResults(results).addCallback(lambda ign: None).addCallback(
+            _joined
+        )
 
 
 class _AgentBase:
@@ -1776,8 +1865,18 @@ def readBody(response: IResponse) -> defer.Deferred[bytes]:
 
         @param deferred: The cancelled L{defer.Deferred}.
         """
+        # A readBody cancel aborts the transport *directly*; it never
+        # consults the pool lease, cache membership or idle timeout.  When
+        # the response belongs to a ledgered HTTP/1.1 connection its reclaim
+        # token provides the direct abort and settles it against the request
+        # generation that owns the connection.
+        token = getattr(response, "_reclaimToken", None)
         abort = getAbort()
+        if abort is None and token is not None:
+            abort = token.abortConnection
         if abort is not None:
+            if token is not None:
+                token.noteReadBodyAbort()
             abort()
 
     d: defer.Deferred[bytes] = defer.Deferred(cancel)
@@ -1788,7 +1887,11 @@ def readBody(response: IResponse) -> defer.Deferred[bytes]:
 
     response.deliverBody(protocol)
 
-    if protocol.transport is not None and getAbort() is None:
+    if (
+        protocol.transport is not None
+        and getAbort() is None
+        and getattr(response, "_reclaimToken", None) is None
+    ):
         warnings.warn(
             "Using readBody with a transport that does not have an "
             "abortConnection method",
@@ -1809,6 +1912,7 @@ __all__ = [
     "HTTPConnectionPool",
     "PartialDownloadError",
     "ProxyAgent",
+    "QuietReclaimLedger",
     "readBody",
     "RedirectAgent",
     "RequestGenerationFailed",
